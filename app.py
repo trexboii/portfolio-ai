@@ -3,6 +3,7 @@ from google import genai
 from google.genai import types
 import os
 import time
+import requests
 
 # --- 1. SETUP & SECRETS ---
 st.set_page_config(page_title="Portfolio Expert AI", page_icon="🧠")
@@ -20,37 +21,59 @@ client = genai.Client(api_key=api_key)
 # We use @st.cache_resource so we don't re-upload files every time 
 # the user clicks a button. It only runs once per session.
 @st.cache_resource
+@st.cache_resource
+@st.cache_resource
 def index_portfolios():
-    """Reads files from the 'portfolios' folder and uploads them to Gemini."""
-    portfolio_folder = "portfolios"
+    """Automatically discovers and downloads PDFs from the latest GitHub Release."""
+    # CHANGE THESE to your actual details
+    GITHUB_OWNER = "trexboii"
+    GITHUB_REPO = "portfolio-ai"
+    
+    # GitHub API endpoint for the latest release
+    api_url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+    
     uploaded_uris = []
     file_names = []
-
-    # Check if folder exists
-    if not os.path.exists(portfolio_folder):
-        return [], ["Error: 'portfolios' folder not found!"]
-
-    files = [f for f in os.listdir(portfolio_folder) if f.endswith('.pdf')]
     
-    if not files:
-        return [], ["No PDF files found in the folder."]
+    try:
+        # 1. Ask GitHub for the list of files (assets) in the release
+        response = requests.get(api_url)
+        response.raise_for_status()
+        assets = response.json().get("assets", [])
+        
+        if not assets:
+            st.warning("No files found in the GitHub Release!")
+            return [], []
 
-    # Upload files
-    for filename in files:
-        file_path = os.path.join(portfolio_folder, filename)
-        
-        # Upload to Gemini
-        file_ref = client.files.upload(file=file_path)
-        
-        # Wait for processing
-        while file_ref.state == "PROCESSING":
-            time.sleep(1)
-            file_ref = client.files.get(name=file_ref.name)
+        # 2. Loop through every file found
+        for asset in assets:
+            filename = asset["name"]
             
-        uploaded_uris.append(file_ref)
-        file_names.append(filename)
-        
-    return uploaded_uris, file_names
+            # Only process PDF portfolios
+            if filename.lower().endswith(".pdf"):
+                download_url = asset["browser_download_url"]
+                
+                # Download the file to a temp location
+                file_data = requests.get(download_url).content
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(file_data)
+                    tmp_path = tmp.name
+                
+                # 3. Upload to Gemini
+                file_ref = client.files.upload(file=tmp_path)
+                while file_ref.state == "PROCESSING":
+                    time.sleep(1)
+                    file_ref = client.files.get(name=file_ref.name)
+                
+                uploaded_uris.append(file_ref)
+                file_names.append(filename)
+                os.remove(tmp_path)
+                
+        return uploaded_uris, file_names
+
+    except Exception as e:
+        st.error(f"Failed to sync with GitHub: {e}")
+        return [], []
 
 # --- 3. UI LAYOUT ---
 st.title("🤖 Portfolio Insight Bot")
