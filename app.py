@@ -4,6 +4,9 @@ import os
 import time
 from pypdf import PdfReader
 from dotenv import load_dotenv
+from datetime import datetime
+from oauth2client.service_account import ServiceAccountCredentials
+import gspread
 
 
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda # Add RunnableLambda
@@ -31,9 +34,9 @@ st.set_page_config(
 )
 
 
-# =========================================================
-# API KEY
-# =========================================================
+
+# API key
+
 
 def setup_api_key():
     load_dotenv()
@@ -51,9 +54,9 @@ def setup_api_key():
     os.environ["GOOGLE_API_KEY"] = api_key
 
 
-# =========================================================
+
 # PDF UTILITIES
-# =========================================================
+
 
 def extract_pdf_text(pdf_files):
     text = ""
@@ -66,9 +69,9 @@ def extract_pdf_text(pdf_files):
     return text
 
 
-# =========================================================
-# VECTOR STORES
-# =========================================================
+
+# Vector stores
+
 
 def load_base_vector_store():
     embeddings = GoogleGenerativeAIEmbeddings(
@@ -95,11 +98,11 @@ def build_session_vector_store(pdf_files):
         model="gemini-embedding-001"
     )
 
-    # --- BATCH PROCESSING FIX ---
+
     vector_store = None
     batch_size = 10  # Process 10 chunks at a time
     
-    # Optional: Show a progress bar in Streamlit
+
     progress_text = "Embedding documents..."
     my_bar = st.progress(0, text=progress_text)
 
@@ -111,22 +114,20 @@ def build_session_vector_store(pdf_files):
             # First batch creates the vector store
             vector_store = FAISS.from_texts(batch_chunks, embeddings)
         else:
-            # Subsequent batches add to the existing store
+            # then batches add to the existing store
             vector_store.add_texts(batch_chunks)
         
         # Update progress bar
         progress_percent = min((i + batch_size) / len(chunks), 1.0)
         my_bar.progress(progress_percent, text=f"{progress_text} ({int(progress_percent*100)}%)")
-
-        # IMPORTANT: Sleep to respect rate limits and avoid server disconnects
         time.sleep(1)
 
     my_bar.empty() # Clear the progress bar when done
     return vector_store
 
-# =========================================================
-# RAG CHAIN (BASE + SESSION)
-# =========================================================
+
+# Add in session
+
 
 def format_docs(docs):
     return "\n\n".join(d.page_content for d in docs)
@@ -142,7 +143,6 @@ def get_combined_retriever(base_vs, session_vs):
 
     def retrieve(query):
         docs = []
-        # invoke() is the standard way to call retrievers in modern LangChain
         docs.extend(base_retriever.invoke(query))
 
         if session_retriever:
@@ -150,7 +150,7 @@ def get_combined_retriever(base_vs, session_vs):
 
         return docs
 
-    # WRAP THE FUNCTION HERE so it supports the | operator
+
     return RunnableLambda(retrieve)
 
 
@@ -188,9 +188,7 @@ def get_rag_chain(base_vs, session_vs):
     )
 
 
-# =========================================================
-# SESSION STATE
-# =========================================================
+#Session state
 
 def init_session_state():
     if "messages" not in st.session_state:
@@ -204,6 +202,27 @@ def init_session_state():
 
     if "rag_chain" not in st.session_state:
         st.session_state.rag_chain = None
+#team info utils
+def connect_sheet():
+    scope = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+    ]
+    creds_dict = dict(st.secrets["gcp_service_account"]) 
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(
+        creds_dict, scope
+    )
+    client = gspread.authorize(creds)
+    sheet = client.open("FTC Team Log").sheet1
+    return sheet
+def save_team(team_number):
+    sheet = connect_sheet()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state.team_number = team_number
+    sheet.append_row([team_number,timestamp])
+
+
+
 
 
 # =========================================================
@@ -211,76 +230,84 @@ def init_session_state():
 # =========================================================
 
 def main():
-    setup_api_key()
-    init_session_state()
+    if "team_number" not in st.session_state:
+        st.session_state.team_number = None
+        setup_api_key()
+        init_session_state()
+    if not st.session_state.team_number:
+        st.title("Enter Your FTC Team Number!")
+        team_input = st.number_input("FTC Team Number", step=1,min_value=1)
+        if st.button("Submit") and team_input>1:
+            save_team(team_input)
+            st.rerun()
+    elif st.session_state.team_number:
+        st.title("🤖 FTC Robotics Portfolio Chatbot")
 
-    st.title("🤖 FTC Robotics Resource Chatbot")
+        # -------- Load base index once --------
+        if st.session_state.base_vector_store is None:
+            if not os.path.exists(INDEX_DIR):
+                st.error("Base FAISS index not found.")
+                st.stop()
 
-    # -------- Load base index once --------
-    if st.session_state.base_vector_store is None:
-        if not os.path.exists(INDEX_DIR):
-            st.error("Base FAISS index not found.")
-            st.stop()
+            st.session_state.base_vector_store = load_base_vector_store()
+            st.session_state.rag_chain = get_rag_chain(
+                st.session_state.base_vector_store,
+                None
+            )
 
-        st.session_state.base_vector_store = load_base_vector_store()
-        st.session_state.rag_chain = get_rag_chain(
-            st.session_state.base_vector_store,
-            None
-        )
+        # Sidebar
+        with st.sidebar:
+            st.header("📚 Your Session Documents")
 
-    # -------- Sidebar --------
-    with st.sidebar:
-        st.header("📚 Your Session Documents")
+            pdf_files = st.file_uploader(
+                "Upload PDFs (session-only)",
+                type="pdf",
+                accept_multiple_files=True
+            )
 
-        pdf_files = st.file_uploader(
-            "Upload PDFs (session-only)",
-            type="pdf",
-            accept_multiple_files=True
-        )
+            if st.button("➕ Add to My Session"):
+                if not pdf_files:
+                    st.warning("Upload at least one PDF.")
+                else:
+                    with st.spinner("Adding documents to your session..."):
+                        st.session_state.session_vector_store = (
+                            build_session_vector_store(pdf_files)
+                        )
+                        st.session_state.rag_chain = get_rag_chain(
+                            st.session_state.base_vector_store,
+                            st.session_state.session_vector_store
+                        )
+                    st.success("Documents added for this session only.")
 
-        if st.button("➕ Add to My Session"):
-            if not pdf_files:
-                st.warning("Upload at least one PDF.")
-            else:
-                with st.spinner("Adding documents to your session..."):
-                    st.session_state.session_vector_store = (
-                        build_session_vector_store(pdf_files)
-                    )
+            if st.session_state.session_vector_store:
+                st.divider()
+                if st.button("🧹 Clear Session Documents"):
+                    st.session_state.session_vector_store = None
                     st.session_state.rag_chain = get_rag_chain(
                         st.session_state.base_vector_store,
-                        st.session_state.session_vector_store
+                        None
                     )
-                st.success("Documents added for this session only.")
+                    st.success("Session documents cleared.")
+                    st.rerun()
 
-        if st.session_state.session_vector_store:
-            st.divider()
-            if st.button("🧹 Clear Session Documents"):
-                st.session_state.session_vector_store = None
-                st.session_state.rag_chain = get_rag_chain(
-                    st.session_state.base_vector_store,
-                    None
-                )
-                st.success("Session documents cleared.")
-                st.rerun()
+        # Chat UI
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
 
-    # -------- Chat UI --------
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+        if question := st.chat_input("Ask a question about FTC robotics..."):
+            st.session_state.messages.append(
+                {"role": "user", "content": question}
+            )
 
-    if question := st.chat_input("Ask a question about FTC robotics..."):
-        st.session_state.messages.append(
-            {"role": "user", "content": question}
-        )
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    answer = st.session_state.rag_chain.invoke(question)
+                    st.markdown(answer)
 
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                answer = st.session_state.rag_chain.invoke(question)
-                st.markdown(answer)
-
-        st.session_state.messages.append(
-            {"role": "assistant", "content": answer}
-        )
+            st.session_state.messages.append(
+                {"role": "assistant", "content": answer}
+            )
 
 
 if __name__ == "__main__":
